@@ -2,14 +2,14 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const { PDFDocument } = require('pdf-lib');
+const { PDFDocument, StandardFonts } = require('pdf-lib');
 const multer = require('multer');
 const upload = multer({ dest: path.join(__dirname, 'uploads') });
 require('dotenv').config();
 const { GoogleGenAI, createUserContent } = require("@google/genai");
 
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(express.json());
@@ -20,6 +20,8 @@ const FIELD_LIST_PATH = path.join(__dirname, 'pdf_fields.json');
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+// Remove the temporary model listing code for deployment
 
 const prompts = {
   discom: `For each of the following, extract the value from the field with the given label in the image and return as JSON:
@@ -68,7 +70,24 @@ Return as:
 If a value is missing, return "".`,
   location: `Extract the following fields from this image and return as JSON:\n{\n  "Latitude": "",\n  "Longitude": ""\n}\nIf a value is missing, return "".`,
   pvModule: `Extract the following fields from this image and return as JSON:\n{\n  "PVMake": "",\n  "PVSerialnumber": "",\n  "Typeofmodule": "",\n  "Capacityofeachmodule": "",\n  "Numberofmodules": "",\n  "Totalcapacity": ""\n}\nIf a value is missing, return "".`,
-  inverter: `Extract the following fields from this image and return as JSON:\n{\n  "InverterMake": "",\n  "InverterModel": "",\n  "InverterSerialnumber": "",\n  "InverterCapacity": "",\n  "Inputvoltage": "",\n  "Outputvoltage": ""\n}\nIf a value is missing, return "".`
+  inverter: `For each of the following, extract the value from the field with the given label in the image and return as JSON:
+- "Make" → "InverterMake"
+- "Model" → "InverterModel"
+- "Serial No." → "InverterSerialnumber"
+- "Capacity" → "InverterCapacity"
+- "Input Voltage" → "Inputvoltage"
+- "Output Voltage" → "Outputvoltage"
+
+Return as:
+{
+  "InverterMake": "",
+  "InverterModel": "",
+  "InverterSerialnumber": "",
+  "InverterCapacity": "",
+  "Inputvoltage": "",
+  "Outputvoltage": ""
+}
+If a value is missing, return "".`
 };
 
 async function callGeminiWithRetries(imageBase64, prompt, mimeType, maxRetries = 5) {
@@ -91,7 +110,7 @@ async function callGeminiWithRetries(imageBase64, prompt, mimeType, maxRetries =
         },
       ];
       const response = await ai.models.generateContent({
-        model: "gemini-1.5-flash",
+        model: "models/gemini-1.5-pro",
         contents: userContent,
       });
       console.log("[Gemini DEBUG] Raw response:", JSON.stringify(response, null, 2));
@@ -127,34 +146,75 @@ async function callGeminiWithRetries(imageBase64, prompt, mimeType, maxRetries =
   return null;
 }
 
+// Utility: Sanitize text to remove/replace non-ASCII characters
+function sanitizeText(str) {
+  if (!str) return '';
+  // Replace common Greek Mu with 'M', and remove other non-ASCII
+  return str.replace(/[\u039C\u03BC]/g, 'M').replace(/[^\x00-\x7F]/g, '');
+}
+
+// Helper to try loading a Unicode font
+async function tryEmbedUnicodeFont(pdfDoc) {
+  const fontPath = path.join(__dirname, 'pdf', 'NotoSans-Regular.ttf');
+  if (fs.existsSync(fontPath)) {
+    const fontBytes = fs.readFileSync(fontPath);
+    return await pdfDoc.embedFont(fontBytes);
+  }
+  return null;
+}
+
+// Updated inverter prompt with explicit field labels (adjust as per your image)
+prompts.inverter = `For each of the following, extract the value from the field with the given label in the image and return as JSON:
+- "Make" → "InverterMake"
+- "Model" → "InverterModel"
+- "Serial No." → "InverterSerialnumber"
+- "Capacity" → "InverterCapacity"
+- "Input Voltage" → "Inputvoltage"
+- "Output Voltage" → "Outputvoltage"
+
+Return as:
+{
+  "InverterMake": "",
+  "InverterModel": "",
+  "InverterSerialnumber": "",
+  "InverterCapacity": "",
+  "Inputvoltage": "",
+  "Outputvoltage": ""
+}
+If a value is missing, return "".`;
+
 app.post('/api/fill-pdf', async (req, res) => {
   try {
+    console.log('Received body:', req.body); // Debug: log incoming data
     if (!fs.existsSync(TEMPLATE_PATH)) {
       return res.status(404).json({ error: 'Template PDF not found' });
     }
     const existingPdfBytes = fs.readFileSync(TEMPLATE_PATH);
     const pdfDoc = await PDFDocument.load(existingPdfBytes);
     const form = pdfDoc.getForm();
-
-    // Use field names from JSON file
     const fieldNames = JSON.parse(fs.readFileSync(FIELD_LIST_PATH, 'utf8'));
-
+    // Try to embed Unicode font
+    let unicodeFont = await tryEmbedUnicodeFont(pdfDoc);
     // Fill only fields that exist in the PDF and are present in the request body
     for (const fieldName of fieldNames) {
       if (req.body[fieldName] !== undefined && req.body[fieldName] !== null && req.body[fieldName] !== '') {
+        let value = req.body[fieldName];
+        if (!unicodeFont) value = sanitizeText(value);
         try {
-          form.getTextField(fieldName).setText(req.body[fieldName]);
+          const textField = form.getTextField(fieldName);
+          if (unicodeFont) textField.updateAppearances(unicodeFont);
+          textField.setText(value);
         } catch (e) {
-          // Not a text field, ignore
+          console.error(`Error setting field '${fieldName}' with value '${value}':`, e.stack || e);
         }
       }
     }
-
     const pdfBytes = await pdfDoc.save();
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', 'attachment; filename=Filled_Solar_Subsidy.pdf');
     res.status(200).send(Buffer.from(pdfBytes));
   } catch (err) {
+    console.error('Failed to generate PDF:', err.stack || err);
     res.status(500).json({ error: 'Failed to generate PDF', details: err.message });
   }
 });
@@ -251,10 +311,15 @@ app.post('/api/gemini-autofill-pdf', upload.fields([
     const pdfDoc = await PDFDocument.load(existingPdfBytes);
     const form = pdfDoc.getForm();
     const fieldNames = JSON.parse(fs.readFileSync(FIELD_LIST_PATH, 'utf8'));
+    let unicodeFont = await tryEmbedUnicodeFont(pdfDoc);
     for (const fieldName of fieldNames) {
       if (merged[fieldName] !== undefined && merged[fieldName] !== null && merged[fieldName] !== '') {
+        let value = merged[fieldName];
+        if (!unicodeFont) value = sanitizeText(value);
         try {
-          form.getTextField(fieldName).setText(merged[fieldName]);
+          const textField = form.getTextField(fieldName);
+          if (unicodeFont) textField.updateAppearances(unicodeFont);
+          textField.setText(value);
         } catch (e) {
           // Not a text field, ignore
         }
